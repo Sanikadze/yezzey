@@ -1,4 +1,13 @@
 #include "yproxy_reader.h"
+#include "gucs.h"
+#include "yproxy_io.h"
+
+#include <errno.h>
+
+extern "C" {
+#include "postgres.h"
+#include "miscadmin.h"
+}
 
 const int kDefaultRetryLimit = 100;
 
@@ -55,10 +64,7 @@ int YProxyReader::prepareYproxyConnection(const ChunkInfo &ci,
 
   auto msg = ConstructCatRequest(ci, start_off);
 
-  size_t rc = ::write(client_fd_, msg.data(), msg.size());
-
-  if (rc <= 0) {
-    // handle
+  if (commonWriteFull(client_fd_, msg) == -1) {
     return -1;
   }
 
@@ -87,28 +93,58 @@ bool YProxyReader::read(char *buffer, size_t *amount) {
       }
       auto rc = this->prepareYproxyConnection(order_[order_ptr_], 0);
       if (rc < 0) {
+        if (++this->current_retry >= this->retry_limit) {
+          this->close();
+          ereport(ERROR,
+                  (errcode(ERRCODE_IO_ERROR),
+                   errmsg("yezzey: failed to connect to yproxy after %d retries for chunk %lu",
+                          retry_limit, (unsigned long)order_ptr_)));
+        }
+        pg_usleep(1000000L); /* 1 second */
         continue;
       }
       current_chunk_offset_ = 0;
       current_chunk_remaining_bytes_ = order_[order_ptr_].size;
     }
 
-    auto rc = ::read(client_fd_, buffer, *amount);
+    auto rc = yproxy_read_with_interrupts(client_fd_, buffer, *amount,
+                                           yproxy_socket_timeout);
     if (rc <= 0) {
-      elog(WARNING, "reacquiring connection on offset %lu",
-           current_chunk_offset_);
+      int saved_errno = errno;
+
+      if (saved_errno == EINTR) {
+        /* PostgreSQL cancel/terminate - do not retry, propagate immediately */
+        this->close();
+        ereport(ERROR,
+                (errcode(ERRCODE_QUERY_CANCELED),
+                 errmsg("yezzey: read interrupted by cancel request on offset %lu",
+                        current_chunk_offset_)));
+      } else if (saved_errno == ETIMEDOUT) {
+        /* Timeout - do not retry, return error */
+        this->close();
+        ereport(ERROR,
+                (errcode(ERRCODE_IO_ERROR),
+                 errmsg("yezzey: read timeout after %d seconds on offset %lu",
+                        yproxy_socket_timeout, current_chunk_offset_)));
+      } else {
+        elog(WARNING, "reacquiring connection on offset %lu",
+             current_chunk_offset_);
+      }
 
       if (++this->current_retry < this->retry_limit) {
         auto rrc = this->prepareYproxyConnection(order_[order_ptr_],
                                                  current_chunk_offset_);
         if (rrc < 0) {
-          sleep(1);
+          pg_usleep(1000000L); /* 1 second */
           continue;
         }
       } else {
         // error, and we are out of retries.
-        *amount = rc;
-        return false;
+        this->close();
+        ereport(ERROR,
+                (errcode(ERRCODE_IO_ERROR),
+                 errmsg("yezzey: failed to read from external storage after %d retries on offset %lu",
+                        retry_limit, current_chunk_offset_)));
       }
       continue;
     }

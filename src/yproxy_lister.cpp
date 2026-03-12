@@ -1,5 +1,11 @@
 #include "yproxy_lister.h"
+#include "gucs.h"
 #include "url.h"
+#include "yproxy_io.h"
+
+#include <errno.h>
+
+/* ereport/elog available via yproxy_connector.h -> io_adv.h -> pg.h */
 
 /*
  *
@@ -22,21 +28,30 @@ std::vector<storageChunkMeta> YProxyLister::list_relation_chunks() {
   std::vector<storageChunkMeta> res;
   auto ret = prepareYproxyConnection();
   if (ret != 0) {
-    // throw?
-    return res;
+    this->close();
+    ereport(ERROR,
+            (errcode(ERRCODE_IO_ERROR),
+             errmsg("yezzey: failed to connect to yproxy for listing chunks")));
   }
 
   auto msg = ConstructListRequest(yezzey_block_db_file_path(
       adv_->nspname, adv_->relname, adv_->coords_, segindx_));
-  size_t rc = ::write(client_fd_, msg.data(), msg.size());
-  if (rc <= 0) {
-    // throw?
-    return res;
+  if (commonWriteFull(client_fd_, msg) == -1) {
+    this->close();
+    ereport(ERROR,
+            (errcode(ERRCODE_IO_ERROR),
+             errmsg("yezzey: failed to send list request to yproxy: %m")));
   }
 
   std::vector<storageChunkMeta> meta;
   while (true) {
     auto message = readMessage();
+    if (message.retCode != 0) {
+      this->close();
+      ereport(ERROR,
+              (errcode(ERRCODE_IO_ERROR),
+               errmsg("yezzey: failed to read chunk list from yproxy: communication error")));
+    }
     switch (message.type) {
     case MessageTypeObjectMeta:
       meta = readObjectMetaBody(&message.content);
@@ -46,8 +61,11 @@ std::vector<storageChunkMeta> YProxyLister::list_relation_chunks() {
       return res;
 
     default:
-      // throw?
-      return res;
+      this->close();
+      ereport(ERROR,
+              (errcode(ERRCODE_IO_ERROR),
+               errmsg("yezzey: unexpected message type %d from yproxy during listing",
+                      message.type)));
     }
   }
 }
@@ -94,9 +112,17 @@ YProxyLister::message YProxyLister::readMessage() {
   char buffer[len];
   // try to read small number of bytes in one op
   // if failed, give up
-  int rc = ::read(client_fd_, buffer, len);
+  int rc = yproxy_read_with_interrupts(client_fd_, buffer, len,
+                                       yproxy_socket_timeout);
   if (rc < 0 || (size_t)rc != len) {
-    // handle
+    if (rc == -1 && errno == ETIMEDOUT) {
+      elog(WARNING,
+           "yproxy socket read timeout after %d seconds (list header)",
+           yproxy_socket_timeout);
+    } else if (rc == -1 && errno == EINTR) {
+      elog(WARNING,
+           "yproxy read interrupted by cancel request (list header)");
+    }
     res.retCode = -1;
     return res;
   }
@@ -110,11 +136,27 @@ YProxyLister::message YProxyLister::readMessage() {
   // substract header
   msgLen -= len;
 
-  char data[msgLen];
-  rc = ::read(client_fd_, data, msgLen);
+  /* Sanity check: prevent excessive allocation from malformed messages */
+  if (msgLen > 16 * 1024 * 1024) {
+    elog(WARNING, "yezzey: yproxy list message too large: %lu bytes", msgLen);
+    res.retCode = -1;
+    return res;
+  }
+
+  /* Heap-allocate: msgLen can be large for list responses */
+  std::vector<char> data(msgLen);
+  rc = yproxy_read_with_interrupts(client_fd_, data.data(), msgLen,
+                                   yproxy_socket_timeout);
 
   if (rc < 0) {
-    // handle
+    if (errno == ETIMEDOUT) {
+      elog(WARNING,
+           "yproxy socket read timeout after %d seconds (list body)",
+           yproxy_socket_timeout);
+    } else if (errno == EINTR) {
+      elog(WARNING,
+           "yproxy read interrupted by cancel request (list body)");
+    }
     res.retCode = -1;
     return res;
   }
@@ -126,7 +168,7 @@ YProxyLister::message YProxyLister::readMessage() {
   }
 
   res.type = data[0];
-  res.content = std::vector<char>(data, data + msgLen);
+  res.content = data;
   return res;
 }
 
@@ -136,7 +178,7 @@ YProxyLister::readObjectMetaBody(std::vector<char> *body) {
   size_t i = PROTO_HEADER_SIZE;
   while (i < body->size()) {
     std::vector<char> buff;
-    while (body->at(i) != 0 && i < body->size()) {
+    while (i < body->size() && body->at(i) != 0) {
       buff.push_back(body->at(i));
       i++;
     }

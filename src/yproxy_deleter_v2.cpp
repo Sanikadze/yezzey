@@ -14,7 +14,8 @@ YProxyDeleterV2::~YProxyDeleterV2() { close(); }
 bool YProxyDeleterV2::Delete(const std::string &chunkName) {
   if (client_fd_ == -1) {
     if (prepareYproxyConnection() == -1) {
-      // Throw here?
+      elog(WARNING, "yezzey: failed to connect to yproxy for delete-obsolete on %s",
+           chunkName.c_str());
       close();
       return false;
     }
@@ -24,11 +25,15 @@ bool YProxyDeleterV2::Delete(const std::string &chunkName) {
   auto msg = ConstructDeleteRequest(chunkName);
 
   if (commonWriteFull(client_fd_, msg) == -1) {
+    elog(WARNING, "yezzey: failed to send delete-obsolete request to yproxy for %s",
+         chunkName.c_str());
     close();
     return false;
   }
   // wait for responce
   if (commonReadRFQResponce(client_fd_) != 0) {
+    elog(WARNING, "yezzey: failed to receive delete-obsolete confirmation from yproxy for %s",
+         chunkName.c_str());
     close();
     return false;
   }
@@ -39,7 +44,8 @@ bool YProxyDeleterV2::Delete(const std::string &chunkName) {
 bool YProxyDeleterV2::Collect(const std::string &chunkName) {
   if (client_fd_ == -1) {
     if (prepareYproxyConnection() == -1) {
-      // Throw here?
+      elog(WARNING, "yezzey: failed to connect to yproxy for collect-obsolete on %s",
+           chunkName.c_str());
       close();
       return false;
     }
@@ -49,12 +55,16 @@ bool YProxyDeleterV2::Collect(const std::string &chunkName) {
   auto msg = ConstructCollectRequest(chunkName);
 
   if (commonWriteFull(client_fd_, msg) == -1) {
+    elog(WARNING, "yezzey: failed to send collect-obsolete request to yproxy for %s",
+         chunkName.c_str());
     close();
     return false;
   }
 
   // wait for responce
   if (commonReadRFQResponce(client_fd_) != 0) {
+    elog(WARNING, "yezzey: failed to receive collect-obsolete confirmation from yproxy for %s",
+         chunkName.c_str());
     close();
     return false;
   }

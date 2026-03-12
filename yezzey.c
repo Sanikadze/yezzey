@@ -65,11 +65,10 @@
 #include "storage.h"
 #include "yezzey.h"
 
-
 #include "tcop/utility.h"
 
-#include "offload_tablespace_map.h"
 #include "binary_upgrade.h"
+#include "offload_tablespace_map.h"
 
 #include "xvacuum.h"
 // options for yezzey logging
@@ -81,7 +80,6 @@ static const struct config_enum_entry loglevel_options[] = {
     {"warning", WARNING, false}, {"error", ERROR, false},
     {"log", LOG, false},         {"fatal", FATAL, false},
     {"panic", PANIC, false},     {NULL, 0, false}};
-
 
 #define GET_STR(textp)                                                         \
   DatumGetCString(DirectFunctionCall1(textout, PointerGetDatum(textp)))
@@ -98,6 +96,7 @@ bool use_otm_feature = false;
 /* YPROXY */
 
 char *yproxy_socket = NULL;
+int yproxy_socket_timeout = 120;
 
 PG_MODULE_MAGIC;
 
@@ -106,7 +105,9 @@ PG_FUNCTION_INFO_V1(yezzey_load_relation);
 PG_FUNCTION_INFO_V1(yezzey_load_relation_seg);
 PG_FUNCTION_INFO_V1(yezzey_force_segment_offload);
 PG_FUNCTION_INFO_V1(yezzey_offload_relation_status_internal);
+PG_FUNCTION_INFO_V1(yezzey_offload_relation_status_modern);
 PG_FUNCTION_INFO_V1(yezzey_offload_relation_status_per_filesegment);
+PG_FUNCTION_INFO_V1(yezzey_offload_relation_status_per_filesegment_modern);
 PG_FUNCTION_INFO_V1(
     yezzey_relation_describe_external_storage_structure_internal);
 PG_FUNCTION_INFO_V1(yezzey_define_relation_offload_policy_internal);
@@ -145,9 +146,8 @@ Datum yezzey_init_metadata_seg(PG_FUNCTION_ARGS) {
   return yezzey_init_metadata(fcinfo);
 }
 
-
 #if IsGreenplum6
-void yezzey_TrackObjDrop (Relation rel);
+void yezzey_TrackObjDrop(Relation rel);
 #endif
 
 int yezzey_offload_relation_internal(Oid reloid, bool remove_locally,
@@ -155,14 +155,13 @@ int yezzey_offload_relation_internal(Oid reloid, bool remove_locally,
 
 int yezzey_delete_chunk_internal(const char *external_chunk_path);
 int yezzey_vacuum_garbage_internal(int segindx, bool confirm, bool crazyDrop);
-int yezzey_vacuum_garbage_relation_internal_oid(Oid reloid,int segindx, bool confirm, bool crazyDrop);
-int yezzey_vacuum_garbage_relation_internal(Relation rel,int segindx, bool confirm, bool crazyDrop);
+int yezzey_vacuum_garbage_relation_internal_oid(Oid reloid, int segindx,
+                                                bool confirm, bool crazyDrop);
+int yezzey_vacuum_garbage_relation_internal(Relation rel, int segindx,
+                                            bool confirm, bool crazyDrop);
 
-void yezzey_object_access_hook (ObjectAccessType access,
-													 Oid classId,
-													 Oid objectId,
-													 int subId,
-													 void *arg);
+void yezzey_object_access_hook(ObjectAccessType access, Oid classId,
+                               Oid objectId, int subId, void *arg);
 
 /*
  * yezzey_define_relation_offload_policy_internal:
@@ -173,12 +172,10 @@ Datum yezzey_define_relation_offload_policy_internal(PG_FUNCTION_ARGS) {
   PG_RETURN_VOID();
 }
 
-
 Datum yezzey_define_relation_offload_policy_internal_prepare(PG_FUNCTION_ARGS) {
   (void)YezzeyDefineOffloadPolicyPrepare(PG_GETARG_OID(0));
   PG_RETURN_VOID();
 }
-
 
 /*
  * yezzey_define_relation_offload_policy_internal_seg:
@@ -241,7 +238,9 @@ int yezzey_load_relation_internal(Oid reloid, const char *dest_path) {
     elog(ERROR, "attempted to load non-offloaded relation");
   }
 
-  Oid loadSpcOid = YezzeyGetRelationOriginTablespaceOid(NULL, NULL, RelationGetRelid(aorel));
+  Oid loadSpcOid = YezzeyGetRelationOriginTablespaceOid(
+      get_namespace_name(aorel->rd_rel->relnamespace),
+      RelationGetRelationName(aorel), RelationGetRelid(aorel));
 
   /* Perform actual deletion of yezzey virtual index and metadata changes */
   (void)YezzeyATExecSetTableSpace(aorel, reloid, loadSpcOid);
@@ -250,8 +249,8 @@ int yezzey_load_relation_internal(Oid reloid, const char *dest_path) {
   if (RelationIsAoRows(aorel)) {
     /* ao rows relation */
 #if IsModernYezzey
-    segfile_array =
-        GetAllFileSegInfo(aorel, appendOnlyMetaDataSnapshot, &total_segfiles, &segrelid);
+    segfile_array = GetAllFileSegInfo(aorel, appendOnlyMetaDataSnapshot,
+                                      &total_segfiles, &segrelid);
 #else
     segfile_array =
         GetAllFileSegInfo(aorel, appendOnlyMetaDataSnapshot, &total_segfiles);
@@ -261,7 +260,8 @@ int yezzey_load_relation_internal(Oid reloid, const char *dest_path) {
       segno = segfile_array[i]->segno;
       elog(yezzey_log_level, "loading segment no %d", segno);
 
-      rc = loadRelationSegment(aorel, loadSpcOid, origrelfilenode, segno, dest_path);
+      rc = loadRelationSegment(aorel, loadSpcOid, origrelfilenode, segno,
+                               dest_path);
       if (rc < 0) {
         elog(ERROR, "failed to offload segment number %d", segno);
       }
@@ -277,7 +277,7 @@ int yezzey_load_relation_internal(Oid reloid, const char *dest_path) {
 #if IsGreenplum6
     segfile_array_cs = GetAllAOCSFileSegInfo(aorel, appendOnlyMetaDataSnapshot,
                                              &total_segfiles);
-#else 
+#else
     segfile_array_cs = GetAllAOCSFileSegInfo(aorel, appendOnlyMetaDataSnapshot,
                                              &total_segfiles, &segrelid);
 #endif
@@ -289,7 +289,8 @@ int yezzey_load_relation_internal(Oid reloid, const char *dest_path) {
         elog(yezzey_log_level, "loading cs segment no %d pseudosegno %d", segno,
              pseudosegno);
 
-        rc = loadRelationSegment(aorel, loadSpcOid, origrelfilenode, pseudosegno, dest_path);
+        rc = loadRelationSegment(aorel, loadSpcOid, origrelfilenode,
+                                 pseudosegno, dest_path);
         if (rc < 0) {
           elog(ERROR, "failed to load cs segment number %d pseudosegno %d",
                segno, pseudosegno);
@@ -310,30 +311,28 @@ int yezzey_load_relation_internal(Oid reloid, const char *dest_path) {
   YezzeyFixupVirtualIndex(aorel);
 
   /*
-  * Update relation status row in yezzet.offload_metadat
-  * State that relation is local, but used to be offloaded
-  */
+   * Update relation status row in yezzet.offload_metadat
+   * State that relation is local, but used to be offloaded
+   */
 
   /* yezzey aux index oid */
   yandexoid = YezzeyFindAuxIndex(reloid);
 
-  /* firstly, delete dependency from pg_depend 
-  * This is needed for next deletion operation to work 
-  */
+  /* firstly, delete dependency from pg_depend
+   * This is needed for next deletion operation to work
+   */
   deleteDependencyRecordsForClass(RelationRelationId, yandexoid,
-                  RelationRelationId,
-                  DEPENDENCY_INTERNAL);
+                                  RelationRelationId, DEPENDENCY_INTERNAL);
 
   deleteDependencyRecordsForClass(RelationRelationId, reloid,
-                  ExtensionRelationId,
-                  DEPENDENCY_NORMAL);
+                                  ExtensionRelationId, DEPENDENCY_NORMAL);
 
   /* make changes visible */
   CommandCounterIncrement();
 
   /* Check if relation hash dedicated vitr index and drop */
   if (yandexoid != YEZZEY_VIRTUAL_INDEX_RELATION) {
-    ObjectAddress object; 
+    ObjectAddress object;
     object.classId = RelationRelationId;
     object.objectId = yandexoid;
     object.objectSubId = 0;
@@ -344,12 +343,12 @@ int yezzey_load_relation_internal(Oid reloid, const char *dest_path) {
   YezzeyLoadRelation(reloid);
 
   /*
-  * Do not empty, just drop
-  * Dropping yezzey virtual index for loaded relation allow to
-  * remove extension dependecy on this object (relation)
-  * empty all track info
-  */
- 
+   * Do not empty, just drop
+   * Dropping yezzey virtual index for loaded relation allow to
+   * remove extension dependecy on this object (relation)
+   * empty all track info
+   */
+
   (void)emptyYezzeyIndex(yandexoid, origrelfilenode);
   /* cleanup */
 
@@ -448,7 +447,6 @@ Datum yezzey_delete_chunk(PG_FUNCTION_ARGS) {
   PG_RETURN_VOID();
 }
 
-
 /* Given external yezzey chunk path, remove it from external storage */
 Datum yezzey_vacuum_garbage(PG_FUNCTION_ARGS) {
   bool confirm;
@@ -487,7 +485,8 @@ Datum yezzey_vacuum_relation(PG_FUNCTION_ARGS) {
     elog(ERROR, "crazyDrop forbidden for non-superuser");
   }
 
-  rc = yezzey_vacuum_garbage_relation_internal_oid(reloid, GpIdentity.segindex, confirm, crazyDrop);
+  rc = yezzey_vacuum_garbage_relation_internal_oid(reloid, GpIdentity.segindex,
+                                                   confirm, crazyDrop);
 
   PG_RETURN_VOID();
 }
@@ -496,7 +495,6 @@ Datum yezzey_binary_upgrade_1_8_to_1_8_1(PG_FUNCTION_ARGS) {
   YezzeyBinaryUpgrade();
   PG_RETURN_VOID();
 }
-
 
 /* Create yezzey metadata tables */
 Datum yezzey_binary_upgrade_1_8_2_to_1_8_3(PG_FUNCTION_ARGS) {
@@ -509,15 +507,16 @@ Datum yezzey_binary_upgrade_1_8_3_to_1_8_4(PG_FUNCTION_ARGS) {
   YezzeyBinaryUpgrade184();
   PG_RETURN_VOID();
 }
+
 Datum yezzey_show_relation_external_path(PG_FUNCTION_ARGS) {
   Oid reloid;
   Relation aorel;
   RelFileNode rnode;
   int32 segno;
-  char *pgptr;
   char *ptr;
   HeapTuple tp;
   char *nspname;
+  text *rt;
 
   reloid = PG_GETARG_OID(0);
   segno = PG_GETARG_OID(1);
@@ -535,28 +534,25 @@ Datum yezzey_show_relation_external_path(PG_FUNCTION_ARGS) {
     ReleaseSysCache(tp);
   } else {
     elog(ERROR, "yezzey: failed to get namescape name of relation %s",
-         aorel->rd_rel->relname.data);
+         RelationGetRelationName(aorel));
   }
 
   (void)getYezzeyExternalStoragePathByCoords(
-      nspname, aorel->rd_rel->relname.data, rnode.spcNode, rnode.dbNode,
+      nspname, RelationGetRelationName(aorel), rnode.spcNode, rnode.dbNode,
       rnode.relNode, segno, GpIdentity.segindex, &ptr);
 
-  pgptr = pstrdup(ptr);
-  free(ptr);
   pfree(nspname);
 
   relation_close(aorel, AccessShareLock);
 
-  PG_RETURN_TEXT_P(cstring_to_text(pgptr));
+  rt = cstring_to_text(ptr);
+
+  pfree(ptr);
+
+  PG_RETURN_TEXT_P(rt);
 }
 
-/**
- * @brief yezzey_offload_relation_status_per_filesegment:
- * List relation external storage usage per filesegment(block)
- */
-Datum yezzey_offload_relation_status_per_filesegment(PG_FUNCTION_ARGS) {
-  Oid reloid;
+static Datum yezzey_ofr_per_fs_worker(PG_FUNCTION_ARGS, bool ext) {
   Relation aorel;
   int i;
   int segno;
@@ -576,8 +572,9 @@ Datum yezzey_offload_relation_status_per_filesegment(PG_FUNCTION_ARGS) {
 #if IsModernYezzey
   Oid segrelid;
 #endif
-
+  Oid reloid;
   reloid = PG_GETARG_OID(0);
+
   segfile_array_cs = NULL;
   segfile_array = NULL;
 
@@ -607,19 +604,19 @@ Datum yezzey_offload_relation_status_per_filesegment(PG_FUNCTION_ARGS) {
     if (RelationIsAoRows(aorel)) {
       /* ao rows relation */
 #if IsModernYezzey
-    segfile_array =
-        GetAllFileSegInfo(aorel, appendOnlyMetaDataSnapshot, &total_segfiles, &segrelid);
+      segfile_array = GetAllFileSegInfo(aorel, appendOnlyMetaDataSnapshot,
+                                        &total_segfiles, &segrelid);
 #else
-    segfile_array =
-        GetAllFileSegInfo(aorel, appendOnlyMetaDataSnapshot, &total_segfiles);
+      segfile_array =
+          GetAllFileSegInfo(aorel, appendOnlyMetaDataSnapshot, &total_segfiles);
 #endif
     } else if (RelationIsAoCols(aorel)) {
 #if IsGreenplum6
-      segfile_array_cs = GetAllAOCSFileSegInfo(aorel, appendOnlyMetaDataSnapshot,
-                                             &total_segfiles);
-#else 
-      segfile_array_cs = GetAllAOCSFileSegInfo(aorel, appendOnlyMetaDataSnapshot,
-                                             &total_segfiles, &segrelid);
+      segfile_array_cs = GetAllAOCSFileSegInfo(
+          aorel, appendOnlyMetaDataSnapshot, &total_segfiles);
+#else
+      segfile_array_cs = GetAllAOCSFileSegInfo(
+          aorel, appendOnlyMetaDataSnapshot, &total_segfiles, &segrelid);
 #endif
     } else {
       elog(ERROR, "wrong relation storage type, not AO/AOCS relation");
@@ -632,11 +629,19 @@ Datum yezzey_offload_relation_status_per_filesegment(PG_FUNCTION_ARGS) {
      */
 
 #if IsGreenplum6
-    funcctx->tuple_desc =
-        CreateTemplateTupleDesc(NUM_USED_OFFLOAD_PER_SEGMENT_STATUS, false);
+    if (ext)
+      funcctx->tuple_desc = CreateTemplateTupleDesc(
+          NUM_USED_OFFLOAD_PER_SEGMENT_STATUS + 1, false);
+    else
+      funcctx->tuple_desc =
+          CreateTemplateTupleDesc(NUM_USED_OFFLOAD_PER_SEGMENT_STATUS, false);
 #else
-    funcctx->tuple_desc =
-        CreateTemplateTupleDesc(NUM_USED_OFFLOAD_PER_SEGMENT_STATUS);
+    if (ext)
+      funcctx->tuple_desc =
+          CreateTemplateTupleDesc(NUM_USED_OFFLOAD_PER_SEGMENT_STATUS + 1);
+    else
+      funcctx->tuple_desc =
+          CreateTemplateTupleDesc(NUM_USED_OFFLOAD_PER_SEGMENT_STATUS);
 #endif
 
     TupleDescInitEntry(funcctx->tuple_desc, (AttrNumber)1, "reloid", OIDOID,
@@ -653,6 +658,11 @@ Datum yezzey_offload_relation_status_per_filesegment(PG_FUNCTION_ARGS) {
     TupleDescInitEntry(funcctx->tuple_desc, (AttrNumber)6, "external_bytes",
                        INT8OID, -1 /* typmod */, 0 /* attdim */);
 
+    if (ext)
+      TupleDescInitEntry(funcctx->tuple_desc, (AttrNumber)7,
+                         "external_bloat_bytes", INT8OID, -1 /* typmod */,
+                         0 /* attdim */);
+
     funcctx->tuple_desc = BlessTupleDesc(funcctx->tuple_desc);
 
     /*
@@ -664,7 +674,7 @@ Datum yezzey_offload_relation_status_per_filesegment(PG_FUNCTION_ARGS) {
 
     if (total_segfiles > 0) {
 
-      if (RelationIsAoRows(aorel)){
+      if (RelationIsAoRows(aorel)) {
         funcctx->max_calls = total_segfiles;
         funcctx->user_fctx = segfile_array;
       } else if (RelationIsAoCols(aorel)) {
@@ -699,8 +709,10 @@ Datum yezzey_offload_relation_status_per_filesegment(PG_FUNCTION_ARGS) {
   }
 
   size_t local_bytes = 0;
-  size_t external_bytes = 0;
+  size_t external_used_bytes = 0;
   size_t local_commited_bytes = 0;
+  size_t external_total_bytes = 0;
+
   if (RelationIsAoRows(aorel)) {
     /* ao rows relation */
 
@@ -716,17 +728,17 @@ Datum yezzey_offload_relation_status_per_filesegment(PG_FUNCTION_ARGS) {
          "stat segment no %d, modcount %ld with to logial eof %ld", segno,
          modcount, logicalEof);
     size_t curr_local_bytes = 0;
-    size_t curr_external_bytes = 0;
+    size_t curr_external_used_bytes = 0;
     size_t curr_local_commited_bytes = 0;
 
     if (statRelationSpaceUsage(aorel, segno, modcount, logicalEof,
                                &curr_local_bytes, &curr_local_commited_bytes,
-                               &curr_external_bytes) < 0) {
+                               &curr_external_used_bytes) < 0) {
       elog(ERROR, "failed to stat segment %d usage", segno);
     }
 
     local_bytes = curr_local_bytes;
-    external_bytes = curr_external_bytes;
+    external_used_bytes = curr_external_used_bytes;
     local_commited_bytes = curr_local_commited_bytes;
 
   } else if (RelationIsAoCols(aorel)) {
@@ -750,25 +762,27 @@ Datum yezzey_offload_relation_status_per_filesegment(PG_FUNCTION_ARGS) {
          "stat segment no %d, modcount %ld with to logial eof %ld", segno,
          modcount, logicalEof);
     size_t curr_local_bytes = 0;
-    size_t curr_external_bytes = 0;
+    size_t curr_external_used_bytes = 0;
     size_t curr_local_commited_bytes = 0;
 
     if (statRelationSpaceUsage(aorel, pseudosegno, modcount, logicalEof,
                                &curr_local_bytes, &curr_local_commited_bytes,
-                               &curr_external_bytes) < 0) {
+                               &curr_external_used_bytes) < 0) {
       elog(ERROR, "failed to stat segment block %d usage", pseudosegno);
     }
 
     local_bytes = curr_local_bytes;
-    external_bytes = curr_external_bytes;
+    external_used_bytes = curr_external_used_bytes;
     local_commited_bytes = curr_local_commited_bytes;
   } else {
     elog(ERROR, "wrong relation storage type, not AO/AOCS");
   }
 
+  external_total_bytes = statExternalTotal(aorel, GpIdentity.segindex);
+
   /* segment if loaded */
-  Datum values[NUM_USED_OFFLOAD_PER_SEGMENT_STATUS];
-  bool nulls[NUM_USED_OFFLOAD_PER_SEGMENT_STATUS];
+  Datum values[NUM_USED_OFFLOAD_PER_SEGMENT_STATUS + 1];
+  bool nulls[NUM_USED_OFFLOAD_PER_SEGMENT_STATUS + 1];
 
   MemSet(nulls, 0, sizeof(nulls));
 
@@ -777,12 +791,16 @@ Datum yezzey_offload_relation_status_per_filesegment(PG_FUNCTION_ARGS) {
 
   if (RelationIsAoRows(aorel)) {
     values[2] = Int32GetDatum(segno);
-  } else if (RelationIsAoCols(aorel)){
+  } else if (RelationIsAoCols(aorel)) {
     values[2] = Int32GetDatum(pseudosegno);
   }
   values[3] = Int64GetDatum(local_bytes);
   values[4] = Int64GetDatum(local_commited_bytes);
-  values[5] = Int64GetDatum(external_bytes);
+  values[5] = Int64GetDatum(external_total_bytes);
+
+  if (ext) {
+    values[6] = Int64GetDatum(external_total_bytes - external_used_bytes);
+  }
 
   HeapTuple tuple = heap_form_tuple(funcctx->tuple_desc, values, nulls);
   Datum result = HeapTupleGetDatum(tuple);
@@ -790,6 +808,22 @@ Datum yezzey_offload_relation_status_per_filesegment(PG_FUNCTION_ARGS) {
   relation_close(aorel, AccessShareLock);
 
   SRF_RETURN_NEXT(funcctx, result);
+}
+
+/**
+ * @brief yezzey_offload_relation_status_per_filesegment:
+ * List relation external storage usage per filesegment(block)
+ */
+Datum yezzey_offload_relation_status_per_filesegment(PG_FUNCTION_ARGS) {
+  return yezzey_ofr_per_fs_worker(fcinfo, false);
+}
+
+/**
+ * @brief yezzey_offload_relation_status_per_filesegment:
+ * List relation external storage usage per filesegment(block)
+ */
+Datum yezzey_offload_relation_status_per_filesegment_modern(PG_FUNCTION_ARGS) {
+  return yezzey_ofr_per_fs_worker(fcinfo, true);
 }
 
 typedef struct yezzeyChunkMetaInfo {
@@ -841,8 +875,6 @@ Datum yezzey_relation_describe_external_storage_structure_internal(
     /* create a function context for cross-call persistence */
     funcctx = SRF_FIRSTCALL_INIT();
 
-    chunkInfo = NULL;
-
     /*
      * switch to memory context appropriate for multiple function calls
      */
@@ -858,9 +890,9 @@ Datum yezzey_relation_describe_external_storage_structure_internal(
     yezzeyChunkMeta *list;
     size_t cnt_chunks;
 
-    if (statRelationChunksSpaceUsage(
-            aorel, &curr_local_bytes,
-            &curr_local_commited_bytes, &list, &cnt_chunks) < 0) {
+    if (statRelationChunksSpaceUsage(aorel, &curr_local_bytes,
+                                     &curr_local_commited_bytes, &list,
+                                     &cnt_chunks) < 0) {
       elog(ERROR, "failed to stat relation chunks space usage");
     }
 
@@ -868,35 +900,32 @@ Datum yezzey_relation_describe_external_storage_structure_internal(
     external_bytes = curr_external_bytes;
     local_commited_bytes = curr_local_commited_bytes;
 
-    chunkInfo = realloc(chunkInfo, sizeof(yezzeyChunkMetaInfo) *
-                                        (cnt_chunks));
+    chunkInfo = palloc0(sizeof(yezzeyChunkMetaInfo) * (cnt_chunks));
 
     for (size_t chunk_index = 0; chunk_index < cnt_chunks; ++chunk_index) {
       chunkInfo[chunk_index].reloid = reloid;
       chunkInfo[chunk_index].segindex = GpIdentity.segindex;
-      chunkInfo[chunk_index].segfileindex = yezzey_get_block_from_file_path(
-                                              list[chunk_index].chunkName);
+      chunkInfo[chunk_index].segfileindex =
+          yezzey_get_block_from_file_path(list[chunk_index].chunkName);
       chunkInfo[chunk_index].external_storage_filepath =
           list[chunk_index].chunkName;
       chunkInfo[chunk_index].local_bytes = local_bytes;
-      chunkInfo[chunk_index].local_commited_bytes =
-          local_commited_bytes;
-      chunkInfo[chunk_index].external_bytes =
-          list[chunk_index].chunkSize;
+      chunkInfo[chunk_index].local_commited_bytes = local_commited_bytes;
+      chunkInfo[chunk_index].external_bytes = list[chunk_index].chunkSize;
     }
 
     /*
-      * Build a tuple descriptor for our result type
-      * The number and type of attributes have to match the definition of the
-      * view yezzey_offload_relation_status_internal
-      */
+     * Build a tuple descriptor for our result type
+     * The number and type of attributes have to match the definition of the
+     * view yezzey_offload_relation_status_internal
+     */
 
 #if IsGreenplum6
     funcctx->tuple_desc = CreateTemplateTupleDesc(
         NUM_USED_OFFLOAD_PER_SEGMENT_STATUS_STRUCT, false);
 #else
-    funcctx->tuple_desc = CreateTemplateTupleDesc(
-        NUM_USED_OFFLOAD_PER_SEGMENT_STATUS_STRUCT);
+    funcctx->tuple_desc =
+        CreateTemplateTupleDesc(NUM_USED_OFFLOAD_PER_SEGMENT_STATUS_STRUCT);
 #endif
 
     TupleDescInitEntry(funcctx->tuple_desc, (AttrNumber)1, "reloid", OIDOID,
@@ -952,16 +981,15 @@ Datum yezzey_relation_describe_external_storage_structure_internal(
     relation_close(aorel, AccessShareLock);
 
     /* cleanup */
-    for (int j = 0; j < funcctx->max_calls; ++ j) {
-      free((char*)chunkInfo[j].external_storage_filepath);
+    for (int j = 0; j < funcctx->max_calls; ++j) {
+      pfree((char *)chunkInfo[j].external_storage_filepath);
     }
 
-    free(chunkInfo);
+    pfree(chunkInfo);
 
     /* do when there is no more left */
     SRF_RETURN_DONE(funcctx);
   }
-
 
   i = call_cntr;
 
@@ -973,7 +1001,7 @@ Datum yezzey_relation_describe_external_storage_structure_internal(
   values[0] = ObjectIdGetDatum(chunkInfo[i].reloid);
   values[1] = Int32GetDatum(GpIdentity.segindex);
   values[2] = Int32GetDatum(chunkInfo[i].segfileindex);
-  values[3] = CStringGetTextDatum(pstrdup(chunkInfo[i].external_storage_filepath));
+  values[3] = CStringGetTextDatum(chunkInfo[i].external_storage_filepath);
   values[4] = Int64GetDatum(chunkInfo[i].local_bytes);
   values[5] = Int64GetDatum(chunkInfo[i].local_commited_bytes);
   values[6] = Int64GetDatum(chunkInfo[i].external_bytes);
@@ -993,8 +1021,7 @@ Datum yezzey_relation_describe_external_storage_structure_internal(
  * usage. Urgent: for now, local stogare usage should be 0 since no
  * cache-logic implemented.
  */
-Datum yezzey_offload_relation_status_internal(PG_FUNCTION_ARGS) {
-  Oid reloid;
+static Datum yezzey_ofr_worker(PG_FUNCTION_ARGS, bool ext) {
   Relation aorel;
   int i;
   int segno;
@@ -1011,11 +1038,11 @@ Datum yezzey_offload_relation_status_internal(PG_FUNCTION_ARGS) {
   AOCSFileSegInfo **segfile_array_cs;
   Snapshot appendOnlyMetaDataSnapshot;
   TupleDesc tupdesc;
+  Oid reloid;
+  reloid = PG_GETARG_OID(0);
 
   segfile_array = NULL;
   segfile_array_cs = NULL;
-
-  reloid = PG_GETARG_OID(0);
 
   /*
    * Lock table in share mode
@@ -1030,15 +1057,17 @@ Datum yezzey_offload_relation_status_internal(PG_FUNCTION_ARGS) {
   appendOnlyMetaDataSnapshot = SnapshotSelf;
 
   size_t local_bytes = 0;
-  size_t external_bytes = 0;
+  size_t external_used_bytes = 0;
   size_t local_commited_bytes = 0;
+
+  size_t external_total_bytes = 0;
 
   if (RelationIsAoRows(aorel)) {
     /* ao rows relation */
 
 #if IsModernYezzey
-    segfile_array =
-        GetAllFileSegInfo(aorel, appendOnlyMetaDataSnapshot, &total_segfiles, &segrelid);
+    segfile_array = GetAllFileSegInfo(aorel, appendOnlyMetaDataSnapshot,
+                                      &total_segfiles, &segrelid);
 #else
     segfile_array =
         GetAllFileSegInfo(aorel, appendOnlyMetaDataSnapshot, &total_segfiles);
@@ -1063,17 +1092,17 @@ Datum yezzey_offload_relation_status_internal(PG_FUNCTION_ARGS) {
       }
 
       local_bytes += curr_local_bytes;
-      external_bytes += curr_external_bytes;
+      external_used_bytes += curr_external_bytes;
       local_commited_bytes += curr_local_commited_bytes;
       /* segment if loaded */
     }
   } else if (RelationIsAoCols(aorel)) {
     /* ao columns, relstorage == 'c' */
 #if IsGreenplum6
-      segfile_array_cs = GetAllAOCSFileSegInfo(aorel, appendOnlyMetaDataSnapshot,
+    segfile_array_cs = GetAllAOCSFileSegInfo(aorel, appendOnlyMetaDataSnapshot,
                                              &total_segfiles);
-#else 
-      segfile_array_cs = GetAllAOCSFileSegInfo(aorel, appendOnlyMetaDataSnapshot,
+#else
+    segfile_array_cs = GetAllAOCSFileSegInfo(aorel, appendOnlyMetaDataSnapshot,
                                              &total_segfiles, &segrelid);
 #endif
 
@@ -1094,17 +1123,17 @@ Datum yezzey_offload_relation_status_internal(PG_FUNCTION_ARGS) {
              "logial eof %ld",
              segno, pseudosegno, modcount, logicalEof);
         size_t curr_local_bytes = 0;
-        size_t curr_external_bytes = 0;
+        size_t curr_external_used_bytes = 0;
         size_t curr_local_commited_bytes = 0;
 
         if (statRelationSpaceUsage(
                 aorel, pseudosegno, modcount, logicalEof, &curr_local_bytes,
-                &curr_local_commited_bytes, &curr_external_bytes) < 0) {
+                &curr_local_commited_bytes, &curr_external_used_bytes) < 0) {
           elog(ERROR, "yezzey: failed to stat segment %d usage", segno);
         }
 
         local_bytes += curr_local_bytes;
-        external_bytes += curr_external_bytes;
+        external_used_bytes += curr_external_used_bytes;
         local_commited_bytes += curr_local_commited_bytes;
         /* segment if offloaded */
       }
@@ -1113,15 +1142,23 @@ Datum yezzey_offload_relation_status_internal(PG_FUNCTION_ARGS) {
     elog(ERROR, "wrong relation type (not AO/AOCS) storage");
   }
 
+  external_total_bytes = statExternalTotal(aorel, GpIdentity.segindex);
+
   /*
    * Build a tuple descriptor for our result type
    * The number and type of attributes have to match the definition of the
    * view yezzey_offload_relation_status_internal
    */
 #if IsGreenplum6
-  tupdesc = CreateTemplateTupleDesc(NUM_YEZZEY_OFFLOAD_STATE_COLS, false);
+  if (ext)
+    tupdesc = CreateTemplateTupleDesc(NUM_YEZZEY_OFFLOAD_STATE_COLS + 1, false);
+  else
+    tupdesc = CreateTemplateTupleDesc(NUM_YEZZEY_OFFLOAD_STATE_COLS, false);
 #else
-  tupdesc = CreateTemplateTupleDesc(NUM_YEZZEY_OFFLOAD_STATE_COLS);
+  if (ext)
+    tupdesc = CreateTemplateTupleDesc(NUM_YEZZEY_OFFLOAD_STATE_COLS + 1);
+  else
+    tupdesc = CreateTemplateTupleDesc(NUM_YEZZEY_OFFLOAD_STATE_COLS);
 #endif
 
   TupleDescInitEntry(tupdesc, (AttrNumber)1, "reloid", OIDOID, -1 /* typmod */,
@@ -1135,10 +1172,14 @@ Datum yezzey_offload_relation_status_internal(PG_FUNCTION_ARGS) {
   TupleDescInitEntry(tupdesc, (AttrNumber)5, "external_bytes", INT8OID,
                      -1 /* typmod */, 0 /* attdim */);
 
+  if (ext)
+    TupleDescInitEntry(tupdesc, (AttrNumber)6, "external_bloat_bytes", INT8OID,
+                       -1 /* typmod */, 0 /* attdim */);
+
   tupdesc = BlessTupleDesc(tupdesc);
 
-  Datum values[NUM_YEZZEY_OFFLOAD_STATE_COLS];
-  bool nulls[NUM_YEZZEY_OFFLOAD_STATE_COLS];
+  Datum values[NUM_YEZZEY_OFFLOAD_STATE_COLS + 1];
+  bool nulls[NUM_YEZZEY_OFFLOAD_STATE_COLS + 1];
 
   MemSet(nulls, 0, sizeof(nulls));
 
@@ -1146,7 +1187,9 @@ Datum yezzey_offload_relation_status_internal(PG_FUNCTION_ARGS) {
   values[1] = Int32GetDatum(GpIdentity.segindex);
   values[2] = Int64GetDatum(local_bytes);
   values[3] = Int64GetDatum(local_commited_bytes);
-  values[4] = Int64GetDatum(external_bytes);
+  values[4] = Int64GetDatum(external_total_bytes);
+  if (ext)
+    values[5] = Int64GetDatum(external_total_bytes - external_used_bytes);
 
   HeapTuple tuple = heap_form_tuple(tupdesc, values, nulls);
   Datum result = HeapTupleGetDatum(tuple);
@@ -1163,6 +1206,14 @@ Datum yezzey_offload_relation_status_internal(PG_FUNCTION_ARGS) {
 
   relation_close(aorel, AccessShareLock);
   PG_RETURN_DATUM(result);
+}
+
+Datum yezzey_offload_relation_status_internal(PG_FUNCTION_ARGS) {
+  return yezzey_ofr_worker(fcinfo, false);
+}
+
+Datum yezzey_offload_relation_status_modern(PG_FUNCTION_ARGS) {
+  return yezzey_ofr_worker(fcinfo, true);
 }
 
 Datum yezzey_set_relation_expirity_seg(PG_FUNCTION_ARGS) {
@@ -1199,19 +1250,15 @@ Datum yezzey_check_part_exr(PG_FUNCTION_ARGS) {
   PG_RETURN_TEXT_P(yezzey_get_expr_worker(expr));
 }
 
-
 /* Plugin provides a hook function matching this signature. */
-void yezzey_object_access_hook (ObjectAccessType access,
-													 Oid classId,
-													 Oid objectId,
-													 int subId,
-													 void *arg) {
+void yezzey_object_access_hook(ObjectAccessType access, Oid classId,
+                               Oid objectId, int subId, void *arg) {
   if (prev_object_access_hook) {
-    (void) prev_object_access_hook(access, classId, objectId, subId, arg);
+    (void)prev_object_access_hook(access, classId, objectId, subId, arg);
   }
   Relation offRel;
   if (classId != RelationRelationId) {
-    return;  
+    return;
   }
 
   if (access == OAT_DROP && subId == 0) {
@@ -1221,17 +1268,17 @@ void yezzey_object_access_hook (ObjectAccessType access,
       return;
     }
 
-    (void)emptyYezzeyIndex(YezzeyFindAuxIndex(RelationGetRelid(offRel)), offRel->rd_node.relNode);
+    (void)emptyYezzeyIndex(YezzeyFindAuxIndex(RelationGetRelid(offRel)),
+                           offRel->rd_node.relNode);
     (void)FixupOffloadMetadata(RelationGetRelid(offRel));
-    
+
     relation_close(offRel, AccessShareLock);
-  } else if (access == OAT_POST_ALTER) { 
+  } else if (access == OAT_POST_ALTER) {
     /* TODO: implement properly */
     /* XXX: what are use cases here? */
     /* (void)YezzeyFixupVirtualIndex(offRel) */;
   }
 }
-
 
 /*
  * Hook ProcessUtility to do external storage vacuum
@@ -1240,149 +1287,199 @@ void yezzey_object_access_hook (ObjectAccessType access,
 /*
 * For Modern yezzey
 * (PlannedStmt *pstmt, const char *queryString,
-									bool readOnlyTree,
-									ProcessUtilityContext context, ParamListInfo params,
-									QueryEnvironment *queryEnv,
-									DestReceiver *dest, QueryCompletion *qc);
+                                                                        bool
+readOnlyTree, ProcessUtilityContext context, ParamListInfo params,
+                                                                        QueryEnvironment
+*queryEnv, DestReceiver *dest, QueryCompletion *qc);
 */
 
-#if IsModernYezzey
-static void
-yezzey_ProcessUtility_hook(PlannedStmt *pstmt,
-                            const char *queryString,
-                            bool readOnlyTree,
-                            ProcessUtilityContext context,
-                            ParamListInfo params,
-                            QueryEnvironment *queryEnv,
-                            DestReceiver *dest,
-                            QueryCompletion *qc)
-#else
-static void
-yezzey_ProcessUtility_hook(Node *parsetree,
-                            const char *queryString,
-                            ProcessUtilityContext context,
-                            ParamListInfo params,
-                            DestReceiver *dest,
-                            char *completionTag)
-#endif
-                            {
+#define YEZZEYTABLESPACE_NAME "yezzey(cloud-storage)"
 
 #if IsModernYezzey
-  Node * parsetree;
+static void
+yezzey_ProcessUtility_hook(PlannedStmt *pstmt, const char *queryString,
+                           bool readOnlyTree, ProcessUtilityContext context,
+                           ParamListInfo params, QueryEnvironment *queryEnv,
+                           DestReceiver *dest, QueryCompletion *qc)
+#else
+static void yezzey_ProcessUtility_hook(Node *parsetree, const char *queryString,
+                                       ProcessUtilityContext context,
+                                       ParamListInfo params, DestReceiver *dest,
+                                       char *completionTag)
+#endif
+{
+  RangeVar *post_later_offload_rel;
+
+  post_later_offload_rel = NULL;
+
+#if IsModernYezzey
+  Node *parsetree;
   if (pstmt->utilityStmt) {
     parsetree = pstmt->utilityStmt;
   } else {
     /*  when?  */
-    return prev_ProcessUtility_hook(pstmt, queryString, readOnlyTree, context, params, queryEnv, dest, qc);
+    return prev_ProcessUtility_hook(pstmt, queryString, readOnlyTree, context,
+                                    params, queryEnv, dest, qc);
   }
 #endif
 
-  newTOASTTableSpace = InvalidOid;
-
-	switch (nodeTag(parsetree))
-
-	{
-    case T_AlterTableStmt:
-      {
-        ListCell  *lcmd;
-        AlterTableStmt *stmt = (AlterTableStmt *) parsetree;
-
-        Relation rel = relation_openrv(stmt->relation, NoLock);
-
-        if (rel->rd_node.spcNode == YEZZEYTABLESPACE_OID) {
-          foreach(lcmd, stmt->cmds)
-          {
-            newTOASTTableSpace = DEFAULTTABLESPACE_OID;
-          }
-        }
-
-        relation_close(rel,NoLock);
-      }
-      break;
-		case T_VacuumStmt:
 #if IsGreenplum6
-			{
-				VacuumStmt *stmt = (VacuumStmt *) parsetree;
-        if(!stmt->relation){
-          break;
-        }
-        Relation rel = relation_openrv(stmt->relation,NoLock);
-        if (stmt->options & VACOPT_YEZZEY && (rel->rd_node.spcNode == YEZZEYTABLESPACE_OID)) {
-          if (Gp_role == GP_ROLE_EXECUTE) {
-            Assert(GpIdentity.segindex != -1);
-            yezzey_vacuum_garbage_relation_internal(rel, GpIdentity.segindex, true, false);
-          }
-        }
-        relation_close(rel,NoLock);
-			}
+  newTOASTTableSpace = InvalidOid;
 #endif
-			break;
-    default:
-      break;
+
+  switch (nodeTag(parsetree)) {
+  case T_CreateStmt: {
+    CreateStmt *stmt = (CreateStmt *)parsetree;
+    if (stmt->tablespacename != NULL &&
+        strcmp(stmt->tablespacename, YEZZEYTABLESPACE_NAME) == 0) {
+      /* save range var for latter. */
+      post_later_offload_rel = stmt->relation;
+    }
+  } break;
+#if IsGreenplum6
+  case T_AlterTableStmt: {
+    ListCell *lcmd;
+    AlterTableStmt *stmt = (AlterTableStmt *)parsetree;
+
+    Relation rel = relation_openrv(stmt->relation, NoLock);
+
+    if (rel->rd_node.spcNode == YEZZEYTABLESPACE_OID) {
+      foreach (lcmd, stmt->cmds) {
+        AlterTableCmd *cmd = (AlterTableCmd *)lfirst(lcmd);
+        if (cmd->subtype == AT_SetTableSpace) {
+          elog(ERROR, "altering YEZZEY relation TABLESPACE is forbidden");
+        }
+        newTOASTTableSpace = YezzeyGetRelationOriginTablespaceOid(
+            get_namespace_name(rel->rd_rel->relnamespace),
+            RelationGetRelationName(rel), RelationGetRelid(rel));
+      }
     }
 
+    relation_close(rel, NoLock);
+  } break;
+#endif
+  case T_VacuumStmt:
+#if IsGreenplum6
+  {
+    VacuumStmt *stmt = (VacuumStmt *)parsetree;
+    if (!stmt->relation) {
+      break;
+    }
+    Relation rel = relation_openrv(stmt->relation, NoLock);
+    if (stmt->options & VACOPT_YEZZEY &&
+        (rel->rd_node.spcNode == YEZZEYTABLESPACE_OID)) {
+      if (Gp_role == GP_ROLE_EXECUTE) {
+        Assert(GpIdentity.segindex != -1);
+        yezzey_vacuum_garbage_relation_internal(rel, GpIdentity.segindex, true,
+                                                false);
+      }
+    }
+    relation_close(rel, NoLock);
+  }
+#endif
+  break;
+  default:
+    break;
+  }
+
 #if IsModernYezzey
-    prev_ProcessUtility_hook(pstmt, queryString, readOnlyTree, context, params, queryEnv, dest, qc);
+  prev_ProcessUtility_hook(pstmt, queryString, readOnlyTree, context, params,
+                           queryEnv, dest, qc);
 #else
-    prev_ProcessUtility_hook(parsetree, queryString, context, params, dest, completionTag);
+  prev_ProcessUtility_hook(parsetree, queryString, context, params, dest,
+                           completionTag);
 #endif
 
-	/* Reset it */
-	newTOASTTableSpace = InvalidOid;
+  if (post_later_offload_rel != NULL) {
+
+    Relation rel = relation_openrv(post_later_offload_rel, NoLock);
+    YezzeyDefineOffloadPolicy(RelationGetRelid(rel));
+    relation_close(rel, NoLock);
+  }
+
+#if IsGreenplum6
+  /* Reset it */
+  newTOASTTableSpace = InvalidOid;
+#endif
 }
 
 static void yezzey_ExecuterEndHook(QueryDesc *queryDesc) {
-  (void) prev_ExecutorEnd_hook(queryDesc);
+  (void)prev_ExecutorEnd_hook(queryDesc);
 
   YezzeyTruncateOTMHint();
 }
 
-
 static void yezzey_ExecuterStartHook(QueryDesc *queryDesc, int eflags) {
-    (void) prev_ExecutorStart_hook(queryDesc, eflags);
+  (void)prev_ExecutorStart_hook(queryDesc, eflags);
 
-    IntoClause *iclause;
-    Oid sourceOid;
+  IntoClause *iclause;
+  Oid sourceOid;
+  Oid targOid;
 
-    if (queryDesc->plannedstmt->intoClause != NULL) {
-      iclause = queryDesc->plannedstmt->intoClause;
-      if (iclause->tableSpaceName && strcmp(iclause->tableSpaceName, "yezzey(cloud-storage)") == 0) {
-        if (queryDesc->plannedstmt->relationOids->length != 1) {
-          elog(ERROR, "unexpected plan relation size for yezzey alter: %d", queryDesc->plannedstmt->relationOids->length);
-        }
+  if (IsA(queryDesc->plannedstmt->planTree, ModifyTable) &&
+      list_length(queryDesc->plannedstmt->relationOids) == 2) {
+
 #if !IsModernYezzey
-        sourceOid = lfirst_oid(queryDesc->plannedstmt->relationOids->head);
+    targOid = lfirst_oid(queryDesc->plannedstmt->relationOids->head);
+    sourceOid = lfirst_oid(queryDesc->plannedstmt->relationOids->tail);
 #else
-        sourceOid = lfirst_oid(list_head(queryDesc->plannedstmt->relationOids));
+    targOid = lfirst_oid(list_head(queryDesc->plannedstmt->relationOids));
+    sourceOid = lfirst_oid(list_tail(queryDesc->plannedstmt->relationOids));
 #endif
-        /* so, target relation is yezzey. This should be expand or alter table reorg; */
-        YezzeyCopyOTM(iclause->rel, sourceOid);
-      }
-    }
-}
 
+    YezzeyPreassignOTM(targOid, sourceOid);
+
+  } else if (queryDesc->plannedstmt->intoClause != NULL) {
+    iclause = queryDesc->plannedstmt->intoClause;
+    if (iclause->tableSpaceName &&
+        strcmp(iclause->tableSpaceName, "yezzey(cloud-storage)") == 0) {
+      if (queryDesc->plannedstmt->relationOids->length != 1) {
+        elog(ERROR, "unexpected plan relation size for yezzey alter: %d",
+             queryDesc->plannedstmt->relationOids->length);
+      }
+#if !IsModernYezzey
+      sourceOid = lfirst_oid(queryDesc->plannedstmt->relationOids->head);
+#else
+      sourceOid = lfirst_oid(list_head(queryDesc->plannedstmt->relationOids));
+#endif
+      /* so, target relation is yezzey. This should be expand or alter table
+       * reorg; */
+      YezzeyCopyOTM(iclause->rel, sourceOid);
+    }
+  }
+}
 
 /* GUC variables. */
 static bool yezzey_autooffload = true; /* start yezzey worker? */
 
 static void yezzey_define_gucs() {
-  DefineCustomStringVariable("yezzey.storage_class", "external storage default storage class",
-                             NULL, &storage_class, "STANDARD", PGC_SUSET, 0, NULL, NULL,
-                             NULL);
+  DefineCustomStringVariable(
+      "yezzey.storage_class", "external storage default storage class", NULL,
+      &storage_class, "STANDARD", PGC_SUSET, 0, NULL, NULL, NULL);
 
-  DefineCustomIntVariable("yezzey.multipart_chunksize", "external storage default multipart chunksize",
-                             NULL, &multipart_chunksize, 16*1024*1024, 0, INT_MAX, PGC_SUSET, 0, NULL, NULL, NULL);
+  DefineCustomIntVariable("yezzey.multipart_chunksize",
+                          "external storage default multipart chunksize", NULL,
+                          &multipart_chunksize, 16 * 1024 * 1024, 0, INT_MAX,
+                          PGC_SUSET, 0, NULL, NULL, NULL);
 
-  DefineCustomIntVariable("yezzey.multipart_threshold", "external storage default multipart threshold",
-                             NULL, &multipart_threshold, 64*1024*1024, 0, INT_MAX, PGC_SUSET, 0, NULL, NULL, NULL);
+  DefineCustomIntVariable("yezzey.multipart_threshold",
+                          "external storage default multipart threshold", NULL,
+                          &multipart_threshold, 64 * 1024 * 1024, 0, INT_MAX,
+                          PGC_SUSET, 0, NULL, NULL, NULL);
 
   DefineCustomBoolVariable("yezzey.use_gpg_crypto", "use gpg crypto", NULL,
                            &use_gpg_crypto, true, PGC_SUSET, 0, NULL, NULL,
                            NULL);
 
+#if IsModernYezzey
   DefineCustomBoolVariable("yezzey.use_otm_feature", "use OTM feature", NULL,
-                           &use_otm_feature, false, PGC_POSTMASTER, 0, NULL, NULL,
+                           &use_otm_feature, false, PGC_BACKEND, 0, NULL, NULL,
                            NULL);
+#else
+  DefineCustomBoolVariable("yezzey.use_otm_feature", "use OTM feature", NULL,
+                           &use_otm_feature, false, PGC_POSTMASTER, 0, NULL,
+                           NULL, NULL);
+#endif
 
   DefineCustomBoolVariable(
       "yezzey.autooffload", "enable auto-offloading worker", NULL,
@@ -1401,13 +1498,18 @@ static void yezzey_define_gucs() {
   DefineCustomStringVariable("yezzey.yproxy_socket", "wal-g config path",
                           NULL, &yproxy_socket, "/tmp/yproxy.sock",
                           PGC_SUSET, 0, NULL, NULL, NULL);
+
+  DefineCustomIntVariable("yezzey.yproxy_socket_timeout",
+                          "timeout in seconds for yproxy socket operations",
+                          NULL, &yproxy_socket_timeout, 120, 1, 3600,
+                          PGC_SUSET, 0, NULL, NULL, NULL);
 }
 
 #if IsGreenplum6
-void yezzey_TrackObjDrop (Relation rel)
-{
+void yezzey_TrackObjDrop(Relation rel) {
   if (rel->rd_node.spcNode == YEZZEYTABLESPACE_OID)
-    (void)emptyYezzeyIndex(YezzeyFindAuxIndex(RelationGetRelid(rel)), rel->rd_node.relNode);
+    (void)emptyYezzeyIndex(YezzeyFindAuxIndex(RelationGetRelid(rel)),
+                           rel->rd_node.relNode);
 }
 #endif
 
@@ -1426,9 +1528,12 @@ void _PG_init(void) {
   smgr_init_hook = smgr_init_yezzey;
 
   /* save old hooks  */
-  prev_ProcessUtility_hook = ProcessUtility_hook ? ProcessUtility_hook : standard_ProcessUtility;
-  prev_ExecutorStart_hook = ExecutorStart_hook ? ExecutorStart_hook : standard_ExecutorStart;
-  prev_ExecutorEnd_hook = ExecutorEnd_hook ? ExecutorEnd_hook : standard_ExecutorEnd;
+  prev_ProcessUtility_hook =
+      ProcessUtility_hook ? ProcessUtility_hook : standard_ProcessUtility;
+  prev_ExecutorStart_hook =
+      ExecutorStart_hook ? ExecutorStart_hook : standard_ExecutorStart;
+  prev_ExecutorEnd_hook =
+      ExecutorEnd_hook ? ExecutorEnd_hook : standard_ExecutorEnd;
   prev_object_access_hook = object_access_hook;
 
   /* set drop hook  */
@@ -1445,10 +1550,9 @@ void _PG_init(void) {
 #endif
 }
 
-
 Datum yezzey_delete_obsolete(PG_FUNCTION_ARGS) {
   bool crazyDrop;
-  crazyDrop = PG_GETARG_BOOL(0);/* not supported */
+  crazyDrop = PG_GETARG_BOOL(0); /* not supported */
   if (crazyDrop && !superuser()) {
 
     elog(ERROR, "crazyDrop forbidden for non-superuser");
@@ -1458,27 +1562,28 @@ Datum yezzey_delete_obsolete(PG_FUNCTION_ARGS) {
     elog(ERROR, "yezzey_delete_obsolete should be executed on SEGMENT");
   }
 
-  Name		db;
-	db = (Name) palloc(NAMEDATALEN);
-	namestrcpy(db, get_database_name(MyDatabaseId));
-  
-  
+  Name db;
+  db = (Name)palloc(NAMEDATALEN);
+  namestrcpy(db, get_database_name(MyDatabaseId));
+
   int rc;
-  rc = yezzey_delele_obsolete_internal(GpIdentity.segindex,crazyDrop,db->data,MyDatabaseTableSpace, MyDatabaseId);
+  rc = yezzey_delele_obsolete_internal(GpIdentity.segindex, crazyDrop, db->data,
+                                       MyDatabaseTableSpace, MyDatabaseId);
   PG_RETURN_VOID();
 }
 
 Datum yezzey_collect_obsolete(PG_FUNCTION_ARGS) {
-	if (GpIdentity.segindex == -1) {
+  if (GpIdentity.segindex == -1) {
     elog(ERROR, "yezzey_collect_obsolete should be executed on SEGMENT");
   }
-  
-  Name		db;
-	db = (Name) palloc(NAMEDATALEN);
-	namestrcpy(db, get_database_name(MyDatabaseId));
+
+  Name db;
+  db = (Name)palloc(NAMEDATALEN);
+  namestrcpy(db, get_database_name(MyDatabaseId));
 
   int rc;
-  rc = yezzey_collect_obsolete_internal(GpIdentity.segindex,db->data,MyDatabaseTableSpace, MyDatabaseId);
+  rc = yezzey_collect_obsolete_internal(GpIdentity.segindex, db->data,
+                                        MyDatabaseTableSpace, MyDatabaseId);
   pfree(db);
 
   PG_RETURN_VOID();

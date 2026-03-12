@@ -20,9 +20,9 @@ protected:
   virtual int prepareYproxyConnection();
 
   struct message {
-    char type;
+    char type{0};
     std::vector<char> content;
-    int retCode;
+    int retCode{0};
   };
   message readMessage();
   std::vector<storageChunkMeta> readObjectMetaBody(std::vector<char> *body);
