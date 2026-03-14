@@ -32,6 +32,7 @@ OBJS = \
 	src/meta.o \
 	src/binary_upgrade.o \
 	src/msgproto.o \
+	src/yproxy_io.o \
 	src/yproxy_connector.o \
 	src/yproxy_deleter.o \
 	src/yproxy_lister.o \

@@ -79,8 +79,11 @@ int offloadRelationSegmentPath(Relation aorel, std::shared_ptr<IOadv> ioadv,
       ioadv, GpIdentity.segindex, modcount, external_storage_path);
 
   if (virtual_size == -1) {
-    elog(NOTICE, "yezzey: failed to calculate virtual size");
-    return -1;
+    FileClose(vfd);
+    ereport(ERROR,
+            (errcode(ERRCODE_IO_ERROR),
+             errmsg("yezzey: failed to calculate virtual relation size for %s",
+                    localPath.c_str())));
   }
 
   elog(NOTICE, "yezzey: relation virtual size calculated: %ld", virtual_size);
@@ -93,8 +96,8 @@ int offloadRelationSegmentPath(Relation aorel, std::shared_ptr<IOadv> ioadv,
   if (fLen < logicalEof) {
     elog(ERROR,
          "yezzey: failed to offload corrupt relation, partial data file %s: "
-         "%lu < %lu",
-         localPath.c_str(), fLen, logicalEof);
+         INT64_FORMAT " < " INT64_FORMAT,
+         localPath.c_str(), (int64)fLen, logicalEof);
   }
 
   /* reset seek to beginning */
@@ -106,8 +109,8 @@ int offloadRelationSegmentPath(Relation aorel, std::shared_ptr<IOadv> ioadv,
   if (fLen < logicalEof) {
     elog(ERROR,
          "yezzey: failed to offload corrupt relation, partial data file %s: "
-         "%lu < %lu",
-         localPath.c_str(), fLen, logicalEof);
+         INT64_FORMAT " < " INT64_FORMAT,
+         localPath.c_str(), (int64)fLen, logicalEof);
   }
 
 #endif
@@ -130,11 +133,18 @@ int offloadRelationSegmentPath(Relation aorel, std::shared_ptr<IOadv> ioadv,
 #endif
     if (rc < 0) {
       FileClose(vfd);
-      return rc;
+      ereport(ERROR,
+              (errcode(ERRCODE_IO_ERROR),
+               errmsg("yezzey: failed to read local file %s during offload",
+                      localPath.c_str())));
     }
     if (rc == 0) {
-      /* maube file whipped away, maybe not, retry */
-      continue;
+      /* EOF before logicalEof — file is shorter than expected */
+      FileClose(vfd);
+      ereport(ERROR,
+              (errcode(ERRCODE_DATA_CORRUPTED),
+               errmsg("yezzey: unexpected EOF reading %s at offset " INT64_FORMAT ", expected " INT64_FORMAT,
+                      localPath.c_str(), progress, logicalEof)));
     }
 
     tot = 0;
@@ -144,7 +154,10 @@ int offloadRelationSegmentPath(Relation aorel, std::shared_ptr<IOadv> ioadv,
       size_t currptrtot = rc - tot;
       if (!iohandler.io_write(bptr, &currptrtot)) {
         FileClose(vfd);
-        return -1;
+        ereport(ERROR,
+                (errcode(ERRCODE_IO_ERROR),
+                 errmsg("yezzey: failed to write data to external storage for %s",
+                        localPath.c_str())));
       }
 
       tot += currptrtot;
@@ -156,25 +169,32 @@ int offloadRelationSegmentPath(Relation aorel, std::shared_ptr<IOadv> ioadv,
 
   auto offset_finish = progress;
 
-  /* data persisted in external storage, we can update out metadata relations */
-  /* insert chunk metadata in virtual index  */
+  /* Save writer state before io_close, since close finalizes the connection */
+  auto insertionLsn = iohandler.writer_->getInsertionStorageLsn();
+  auto externalPath = iohandler.writer_->getExternalStoragePath();
+
+  /* First confirm S3 upload is complete, then update metadata */
+  if (!iohandler.io_close()) {
+    FileClose(vfd);
+    ereport(ERROR,
+            (errcode(ERRCODE_IO_ERROR),
+             errmsg("yezzey: failed to complete external storage write for %s",
+                    localPath.c_str())));
+  }
+
+  elog(DEBUG1, "yezzey: complete %s offloading", localPath.c_str());
+
+  /* S3 upload confirmed — safe to update metadata */
   YezzeyUpdateMetadataRelations(
       YezzeyFindAuxIndex(aorel->rd_id), ioadv->reloid, ioadv->coords_.filenode,
       ioadv->coords_.blkno /* blkno*/, offset_start, offset_finish,
       iohandler.adv_->use_gpg_crypto /* encrypted */, iohandler.use_kek(),
-      0 /* reused */, modcount, iohandler.writer_->getInsertionStorageLsn(),
-      iohandler.writer_->getExternalStoragePath().c_str() /* path */,
+      0 /* reused */, modcount, insertionLsn,
+      externalPath.c_str() /* path */,
       yezzey_fqrelname_md5(ioadv->nspname, ioadv->relname).c_str());
 
-  if (!iohandler.io_close()) {
-    elog(ERROR, "yezzey: failed to complete %s offloading", localPath.c_str());
-  } else {
-    // debug output
-    elog(DEBUG1, "yezzey: complete %s offloading", localPath.c_str());
-  }
-
   FileClose(vfd);
-  return rc;
+  return 0;
 }
 
 int loadSegmentFromExternalStorage(Relation rel, const std::string &nspname,
@@ -214,14 +234,13 @@ int loadSegmentFromExternalStorage(Relation rel, const std::string &nspname,
     size_t amount = chunkSize;
     if (!iohandler.io_read(buffer.data(), &amount)) {
       elog(ERROR, "failed to read file from external storage");
-      return -1;
     }
 
     /* code */
 
     ostrm.write(buffer.data(), amount);
     if (ostrm.fail()) {
-      elog(ERROR, "failed to read file from external storage");
+      elog(ERROR, "failed to write data to local storage");
     }
 
     xlog_ao_insert(rnode, segno, position, buffer.data(), amount);
@@ -354,11 +373,14 @@ int offloadRelationSegment(Relation aorel, int segno, int64 modcount,
   try {
     if ((rc = offloadRelationSegmentPath(aorel, ioadv, modcount, logicalEof,
                                          storage_path)) < 0) {
-      return rc;
+      ereport(ERROR,
+              (errcode(ERRCODE_IO_ERROR),
+               errmsg("yezzey: offload failed for relation %s segment %d",
+                      aorel->rd_rel->relname.data, segno)));
     }
   } catch (...) {
-    elog(ERROR, "Caught an unexpected exception.");
-    return -1;
+    elog(ERROR, "yezzey: caught unexpected C++ exception during offload of relation %s",
+         aorel->rd_rel->relname.data);
   }
 
   /* we dont need to interact with s3 while in recovery*/
@@ -412,7 +434,7 @@ Oid resolveTablespaceOidByName(std::string tablespacename) {
   }
 
 #if PG_VERSION_NUM >= 120000
-  resOid = ((Form_pg_class)GETSTRUCT(tuple))->oid;
+  resOid = ((Form_pg_tablespace) GETSTRUCT(tuple))->oid;
 #else
   resOid = HeapTupleGetOid(tuple);
 #endif
@@ -422,39 +444,6 @@ Oid resolveTablespaceOidByName(std::string tablespacename) {
   yezzey_relation_close(rel, RowExclusiveLock);
 
   return resOid;
-}
-
-int statExternalTotal(Relation aorel, int segindx) {
-  auto rnode = aorel->rd_node;
-
-  auto tp = SearchSysCache1(NAMESPACEOID,
-                            ObjectIdGetDatum(aorel->rd_rel->relnamespace));
-
-  if (!HeapTupleIsValid(tp)) {
-    elog(ERROR, "yezzey: failed to get namescape name of relation %s",
-         RelationGetRelationName(aorel));
-  }
-
-  Form_pg_namespace nsptup = (Form_pg_namespace)GETSTRUCT(tp);
-  auto nspname = std::string(NameStr(nsptup->nspname));
-
-  ReleaseSysCache(tp);
-
-  /* rnode.spcNode == YEZZEYTABLESPACEOID here. we need
-  to lookup in metadata table to resolve origin tablespace */
-
-  auto spcNode = resolveTablespaceOidByName(
-      YezzeyGetRelationOriginTablespace(NULL, NULL, RelationGetRelid(aorel)));
-
-  auto coords =
-      relnodeCoord(spcNode, rnode.dbNode, rnode.relNode, -1 /* not used */);
-
-  auto ioadv = std::make_shared<IOadv>(
-      nspname, std::string(RelationGetRelationName(aorel)),
-      std::string(storage_class /*storage_class*/), multipart_chunksize,
-      coords /* coords */, aorel->rd_id /* reloid */, use_gpg_crypto,
-      yproxy_socket);
-  return yezzey_virtual_relation_size(ioadv, segindx);
 }
 
 int statRelationSpaceUsage(Relation aorel, int segno, int64 modcount,
@@ -531,6 +520,44 @@ int statRelationSpaceUsage(Relation aorel, int segno, int64 modcount,
   // encrypted & compressed.
   // *local_commited_bytes = logicalEof - virtual_sz;
   return 0;
+}
+
+int64_t statExternalTotal(Relation aorel, int segindx) {
+  auto rnode = aorel->rd_node;
+
+  auto tp = SearchSysCache1(NAMESPACEOID,
+                            ObjectIdGetDatum(aorel->rd_rel->relnamespace));
+
+  if (!HeapTupleIsValid(tp)) {
+    elog(ERROR, "yezzey: failed to get namespace name of relation %s",
+         RelationGetRelationName(aorel));
+  }
+
+  Form_pg_namespace nsptup = (Form_pg_namespace)GETSTRUCT(tp);
+  auto nspname = std::string(NameStr(nsptup->nspname));
+
+  ReleaseSysCache(tp);
+
+  /* rnode.spcNode == YEZZEYTABLESPACEOID here. we need
+  to lookup in metadata table to resolve origin tablespace */
+
+  auto spcNode = resolveTablespaceOidByName(
+      YezzeyGetRelationOriginTablespace(NULL, NULL, RelationGetRelid(aorel)));
+
+  auto coords =
+      relnodeCoord(spcNode, rnode.dbNode, rnode.relNode, -1 /* not used */);
+
+  auto ioadv = std::make_shared<IOadv>(
+      nspname, std::string(RelationGetRelationName(aorel)),
+      std::string(storage_class /*storage_class*/), multipart_chunksize,
+      coords /* coords */, aorel->rd_id /* reloid */, use_gpg_crypto,
+      yproxy_socket);
+  auto virtual_sz = yezzey_virtual_relation_size(ioadv, segindx);
+  if (virtual_sz == -1) {
+    elog(ERROR, "yezzey: failed to stat external size of relation %s",
+         RelationGetRelationName(aorel));
+  }
+  return virtual_sz;
 }
 
 int statRelationChunksSpaceUsage(Relation aorel, size_t *local_bytes,

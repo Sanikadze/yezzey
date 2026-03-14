@@ -53,7 +53,7 @@ EXTERNC int statRelationSpaceUsage(Relation aorel, int segno, int64 modcount,
                                    size_t *local_commited_bytes,
                                    size_t *external_bytes);
 
-EXTERNC int statExternalTotal(Relation aorel, int segindx);
+EXTERNC int64_t statExternalTotal(Relation aorel, int segindx);
 
 EXTERNC int statRelationChunksSpaceUsage(Relation aorel, size_t *local_bytes,
                                          size_t *local_commited_bytes,

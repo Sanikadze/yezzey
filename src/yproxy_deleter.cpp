@@ -18,7 +18,8 @@ YProxyDeleter::~YProxyDeleter() { close(); }
 bool YProxyDeleter::deleteChunk(const std::string &chunkName) {
   if (client_fd_ == -1) {
     if (prepareYproxyConnection() == -1) {
-      // Throw here?
+      elog(WARNING, "yezzey: failed to connect to yproxy for delete operation on %s",
+           chunkName.c_str());
       close();
       return false;
     }
@@ -28,11 +29,15 @@ bool YProxyDeleter::deleteChunk(const std::string &chunkName) {
   auto msg = ConstructDeleteRequest(chunkName);
 
   if (commonWriteFull(client_fd_, msg) == -1) {
+    elog(WARNING, "yezzey: failed to send delete request to yproxy for %s",
+         chunkName.c_str());
     close();
     return false;
   }
   // wait for responce
   if (commonReadRFQResponce(client_fd_) != 0) {
+    elog(WARNING, "yezzey: failed to receive delete confirmation from yproxy for %s",
+         chunkName.c_str());
     close();
     return false;
   }

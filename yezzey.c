@@ -96,6 +96,7 @@ bool use_otm_feature = false;
 /* YPROXY */
 
 char *yproxy_socket = NULL;
+int yproxy_socket_timeout = 120;
 
 PG_MODULE_MAGIC;
 
@@ -1494,9 +1495,14 @@ static void yezzey_define_gucs() {
                            &yezzey_ao_log_level, DEBUG1, loglevel_options,
                            PGC_SUSET, 0, NULL, NULL, NULL);
 
-  DefineCustomStringVariable("yezzey.yproxy_socket", "wal-g config path", NULL,
-                             &yproxy_socket, "/tmp/yproxy.sock", PGC_SUSET, 0,
-                             NULL, NULL, NULL);
+  DefineCustomStringVariable("yezzey.yproxy_socket", "wal-g config path",
+                          NULL, &yproxy_socket, "/tmp/yproxy.sock",
+                          PGC_SUSET, 0, NULL, NULL, NULL);
+
+  DefineCustomIntVariable("yezzey.yproxy_socket_timeout",
+                          "timeout in seconds for yproxy socket operations",
+                          NULL, &yproxy_socket_timeout, 120, 1, 3600,
+                          PGC_SUSET, 0, NULL, NULL, NULL);
 }
 
 #if IsGreenplum6

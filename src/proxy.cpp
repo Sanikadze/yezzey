@@ -9,7 +9,7 @@
 #include "virtual_index.h"
 
 #include "util.h"
-#include <cassert>
+
 
 #include "io.h"
 #include "io_adv.h"
@@ -331,7 +331,16 @@ void yezzey_FileClose(SMGRFile file) {
 
   if (yfd.y_vfd == YEZZEY_OFFLOADED_FD) {
     if (!RecoveryInProgress()) {
-      assert(yfd.handler);
+      if (!yfd.handler) {
+        elog(ERROR, "yezzey: null handler for offloaded fd %d during close", file);
+      }
+      /* Save writer state before io_close, since close finalizes the connection */
+      XLogRecPtr insertionLsn = 0;
+      std::string externalPath;
+      if (yfd.op_write && yfd.handler->writer_) {
+        insertionLsn = yfd.handler->writer_->getInsertionStorageLsn();
+        externalPath = yfd.handler->writer_->getExternalStoragePath();
+      }
       if (!yfd.handler->io_close()) {
         // very bad
         elog(ERROR, "failed to complete external storage interaction: fd %d",
@@ -349,8 +358,8 @@ void yezzey_FileClose(SMGRFile file) {
             yfd.offset /* io operation finish offset */,
             yfd.handler->adv_->use_gpg_crypto /* encrypted */,
             yfd.handler->use_kek(), 0 /* reused */, yfd.modcount,
-            yfd.handler->writer_->getInsertionStorageLsn(),
-            yfd.handler->writer_->getExternalStoragePath().c_str() /* path ? */,
+            insertionLsn,
+            externalPath.c_str() /* path ? */,
             yezzey_fqrelname_md5(yfd.nspname, yfd.relname).c_str());
       }
     } else {
@@ -386,7 +395,9 @@ int yezzey_FileWrite(SMGRFile file, char *buffer, int amount)
 
   File actual_fd = yfd.y_vfd;
   if (actual_fd == YEZZEY_OFFLOADED_FD) {
-    assert(yfd.modcount);
+    if (!yfd.modcount) {
+      elog(ERROR, "yezzey: zero modcount for write on fd %d", file);
+    }
 
     /* Assert here we are not in crash or regular recovery
      * If yes, simply skip this call as data is already
@@ -403,8 +414,9 @@ int yezzey_FileWrite(SMGRFile file, char *buffer, int amount)
 #endif
     size_t rc = amount;
     if (!yfd.handler->io_write(buffer, &rc)) {
-      elog(WARNING, "failed to write to external storage");
-      return -1;
+      ereport(ERROR,
+              (errcode(ERRCODE_IO_ERROR),
+               errmsg("yezzey: failed to write to external storage")));
     }
     elog(yezzey_ao_log_level,
          "yezzey_FileWrite: write %d bytes, %ld transfered, yezzey fd %d",
@@ -452,11 +464,10 @@ int yezzey_FileRead(SMGRFile file, char *buffer, int amount) {
 #endif
     } else {
       if (!yfd.handler->io_read(buffer, &curr)) {
-        elog(yezzey_ao_log_level,
-             "yezzey_FileRead: problem while direct read from s3 read with %d "
-             "curr: %ld",
-             file, curr);
-        return -1;
+        ereport(ERROR,
+                (errcode(ERRCODE_IO_ERROR),
+                 errmsg("yezzey: failed to read from external storage for fd %d",
+                        file)));
       }
 #ifdef DISKCACHE
 /* CACHE_LOCAL_WRITES_FEATURE to do*/
@@ -497,7 +508,9 @@ EXTERNC int yezzey_FileTruncate(SMGRFile yezzey_fd, int64 offset)
      */
 
     if (!RecoveryInProgress()) {
-      assert(yfd.handler);
+      if (!yfd.handler) {
+        elog(ERROR, "yezzey: null handler for offloaded fd %d during truncate", yezzey_fd);
+      }
 
       /* if truncatetoeof, do nothing */
       /* we need addintinal checks that offset == virtual_size */

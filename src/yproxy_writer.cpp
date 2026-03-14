@@ -1,5 +1,11 @@
 #include "yproxy_writer.h"
+#include "gucs.h"
 #include "url.h"
+#include "yproxy_io.h"
+
+#include <errno.h>
+
+/* ereport/elog available via yproxy_writer.h -> yproxy_connector.h -> io_adv.h -> pg.h */
 
 std::string YProxyWriter::createXPath() {
   return craftStorageUnPrefixedPath(adv_, segindx_, modcount_,
@@ -26,13 +32,14 @@ bool YProxyWriter::close() {
   if (commonWriteFull(client_fd_, msg) == -1) {
     ::close(client_fd_);
     client_fd_ = -1;
+    elog(WARNING, "yezzey: failed to send CopyDone to yproxy: %m");
     return false;
   }
 
   if (readPutCompleteResponce(client_fd_) != 0) {
     ::close(client_fd_);
     client_fd_ = -1;
-    // TODO: handle
+    elog(WARNING, "yezzey: failed to receive PutComplete from yproxy");
     return false;
   }
 
@@ -40,7 +47,7 @@ bool YProxyWriter::close() {
   if (commonReadRFQResponce(client_fd_) != 0) {
     ::close(client_fd_);
     client_fd_ = -1;
-    // some error, handle
+    elog(WARNING, "yezzey: failed to receive ReadyForQuery from yproxy after write");
     return false;
   }
   ::close(client_fd_);
@@ -51,8 +58,10 @@ bool YProxyWriter::close() {
 bool YProxyWriter::write(const char *buffer, size_t *amount) {
   if (client_fd_ == -1) {
     if (prepareYproxyConnection() == -1) {
-      // Throw here?
-      return false;
+      this->close();
+      ereport(ERROR,
+              (errcode(ERRCODE_IO_ERROR),
+               errmsg("yezzey: failed to connect to yproxy for writing to external storage")));
     }
   }
 
@@ -60,8 +69,10 @@ bool YProxyWriter::write(const char *buffer, size_t *amount) {
   auto msg = ConstructCopyDataRequest(buffer, *amount);
 
   if (commonWriteFull(client_fd_, msg) == -1) {
-    *amount = 0;
-    return false;
+    this->close();
+    ereport(ERROR,
+            (errcode(ERRCODE_IO_ERROR),
+             errmsg("yezzey: failed to write to external storage: %m")));
   }
   // *amount does not need to change in case of successfull write
 
@@ -89,9 +100,17 @@ int YProxyWriter::readPutCompleteResponce(int client_fd_) {
   char buffer[len];
   // try to read small number of bytes in one op
   // if failed, give up
-  int rc = ::read(client_fd_, buffer, len);
+  int rc = yproxy_read_with_interrupts(client_fd_, buffer, len,
+                                       yproxy_socket_timeout);
   if (rc != len) {
-    // handle
+    if (rc == -1 && errno == ETIMEDOUT) {
+      elog(WARNING,
+           "yproxy socket read timeout after %d seconds (PutComplete header)",
+           yproxy_socket_timeout);
+    } else if (rc == -1 && errno == EINTR) {
+      elog(WARNING,
+           "yproxy read interrupted by cancel request (PutComplete header)");
+    }
     return -1;
   }
 
@@ -102,7 +121,7 @@ int YProxyWriter::readPutCompleteResponce(int client_fd_) {
   }
 
   if (msgLen != MSG_HEADER_SIZE + PROTO_HEADER_SIZE + 2) {
-    // protocol violation
+    elog(WARNING, "yezzey: yproxy PutComplete protocol violation: unexpected message length %lu", msgLen);
     return -1;
   }
 
@@ -110,16 +129,26 @@ int YProxyWriter::readPutCompleteResponce(int client_fd_) {
   msgLen -= len;
 
   char data[msgLen];
-  rc = ::read(client_fd_, data, msgLen);
+  rc = yproxy_read_with_interrupts(client_fd_, data, msgLen,
+                                   yproxy_socket_timeout);
   if (rc < 0) {
+    if (errno == ETIMEDOUT) {
+      elog(WARNING,
+           "yproxy socket read timeout after %d seconds (PutComplete body)",
+           yproxy_socket_timeout);
+    } else if (errno == EINTR) {
+      elog(WARNING,
+           "yproxy read interrupted by cancel request (PutComplete body)");
+    }
     return -1;
   }
   if (uint64_t(rc) != msgLen) {
-    // handle
+    elog(WARNING, "yezzey: yproxy PutComplete short read: expected %lu bytes, got %d", msgLen, rc);
     return -1;
   }
 
   if (data[0] != MessageTypePutComplete) {
+    elog(WARNING, "yezzey: yproxy unexpected message type %d, expected PutComplete", data[0]);
     return -1;
   }
   uint16_t kv = uint8_t(data[4]) + (1 << 8) * uint16_t(data[5]);
